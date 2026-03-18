@@ -108,8 +108,12 @@ def get_delta_pose_with_scheme(
     coord_transform_scheme = task_constraint["coordination_scheme"]
     device = src_obj_pose.device
     if coord_transform_scheme == SubTaskConstraintCoordinationScheme.TRANSFORM:
-        delta_pose = PoseUtils.get_delta_object_pose(cur_obj_pose, src_obj_pose)
-        # add noise to delta pose position
+        # IsaacLab versions differ: some expose get_delta_object_pose, some do not.
+        if hasattr(PoseUtils, "get_delta_object_pose"):
+            delta_pose = PoseUtils.get_delta_object_pose(cur_obj_pose, src_obj_pose)
+        else:
+            # Equivalent transform: T_delta = T_cur * inv(T_src)
+            delta_pose = cur_obj_pose @ torch.linalg.inv(src_obj_pose)
     elif coord_transform_scheme == SubTaskConstraintCoordinationScheme.TRANSLATE:
         delta_pose = torch.eye(4, device=device)
         delta_pose[:3, 3] = cur_obj_pose[:3, 3] - src_obj_pose[:3, 3]
@@ -151,6 +155,9 @@ class DataGenerator:
         src_demo_datagen_info_pool: DataGenInfoPool | None = None,
         dataset_path: str | None = None,
         demo_keys: list[str] | None = None,
+        post_reset_settle_steps: int = 0,
+        post_reset_hold_action: torch.Tensor | np.ndarray | None = None,
+        recenter_shoulder_pan_before_recording: bool = False,
     ):
         """
         Args:
@@ -159,11 +166,22 @@ class DataGenerator:
             dataset_path: path to hdf5 dataset to use for generation
             demo_keys: list of demonstration keys to use in file. If not provided,
                 all demonstration keys will be used.
+            post_reset_settle_steps: Number of hold-action steps to execute after each env reset.
+            post_reset_hold_action: Optional per-env action vector to apply while settling after reset.
+            recenter_shoulder_pan_before_recording: Whether to snap left/right shoulder_pan joints
+                to zero after cloth settle and before recorder start.
         """
         self.env = env
         self.env_cfg = env.cfg
         assert isinstance(self.env_cfg, MimicEnvCfg)
         self.dataset_path = dataset_path
+        self.post_reset_settle_steps = max(0, int(post_reset_settle_steps))
+        self.recenter_shoulder_pan_before_recording = bool(recenter_shoulder_pan_before_recording)
+        self.post_reset_hold_action = None
+        if post_reset_hold_action is not None:
+            self.post_reset_hold_action = torch.as_tensor(
+                post_reset_hold_action, device=self.env.device, dtype=torch.float32
+            ).reshape(-1)
 
         # Sanity check on task spec offset ranges - final subtask should not have any offset randomization
         for subtask_configs in self.env_cfg.subtask_configs.values():
@@ -187,6 +205,81 @@ class DataGenerator:
         msg = str(self.__class__.__name__)
         msg += f" (\n\tdataset_path={self.dataset_path}\n\tdemo_keys={self.demo_keys}\n)"
         return msg
+
+    def _get_post_reset_hold_action(self) -> torch.Tensor:
+        """Return per-env hold action used while cloth settles after reset."""
+        if hasattr(self.env, "single_action_space") and hasattr(self.env.single_action_space, "shape"):
+            action_dim = int(self.env.single_action_space.shape[0])
+        else:
+            action_dim = int(self.env.action_space.shape[-1])
+
+        if self.post_reset_hold_action is None:
+            return torch.zeros(action_dim, device=self.env.device, dtype=torch.float32)
+
+        if int(self.post_reset_hold_action.numel()) != action_dim:
+            raise ValueError(
+                "post_reset_hold_action dimension mismatch: "
+                f"expected {action_dim}, got {int(self.post_reset_hold_action.numel())}."
+            )
+        return self.post_reset_hold_action
+
+    async def _settle_after_reset(self, env_id: int, env_action_queue: asyncio.Queue | None) -> None:
+        """Advance a just-reset cloth scene with a safe hold action before sampling object pose."""
+        if self.post_reset_settle_steps <= 0 or not hasattr(self.env, "object"):
+            return
+
+        hold_action = self._get_post_reset_hold_action()
+        if env_action_queue is None:
+            if int(getattr(self.env, "num_envs", 1)) != 1:
+                raise RuntimeError("Post-reset settling without env_action_queue only supports single-env generation.")
+            batched_action = hold_action.unsqueeze(0)
+            for _ in range(self.post_reset_settle_steps):
+                self.env.step(batched_action)
+            return
+
+        for _ in range(self.post_reset_settle_steps):
+            await env_action_queue.put((env_id, hold_action.clone()))
+            await env_action_queue.join()
+
+    def _recenter_shoulder_pan_before_recording(self, env_id: int) -> None:
+        """Snap bimanual shoulder-pan joints to zero before the episode starts recording."""
+        if not self.recenter_shoulder_pan_before_recording:
+            return
+
+        scene = getattr(self.env, "scene", None)
+        if scene is None:
+            return
+
+        env_ids = torch.tensor([env_id], dtype=torch.int64, device=self.env.device)
+        shoulder_target = torch.zeros((1, 1), dtype=torch.float32, device=self.env.device)
+        updated_any_joint = False
+
+        for arm_name in ("left_arm", "right_arm"):
+            try:
+                arm = scene[arm_name]
+            except Exception:
+                continue
+
+            joint_names = list(getattr(arm, "joint_names", getattr(arm.data, "joint_names", [])))
+            if "shoulder_pan" not in joint_names:
+                continue
+
+            joint_id = joint_names.index("shoulder_pan")
+            arm.write_joint_state_to_sim(shoulder_target, shoulder_target, joint_ids=[joint_id], env_ids=env_ids)
+            arm.set_joint_position_target(shoulder_target, joint_ids=[joint_id], env_ids=env_ids)
+            updated_any_joint = True
+
+        if not updated_any_joint:
+            return
+
+        self.env.scene.write_data_to_sim()
+        self.env.sim.forward()
+        if self.env.sim.has_rtx_sensors():
+            num_rerenders = max(1, int(getattr(self.env.cfg, "num_rerenders_on_reset", 1)))
+            for _ in range(num_rerenders):
+                self.env.sim.render()
+        self.env.scene.update(dt=self.env.physics_dt)
+        self.env.obs_buf = self.env.observation_manager.compute(update_history=True)
 
     def randomize_subtask_boundaries(self) -> dict[str, np.ndarray]:
         """Apply random offsets to sample subtask boundaries according to the task spec.
@@ -620,6 +713,7 @@ class DataGenerator:
         success_term: TerminationTermCfg,
         env_reset_queue: asyncio.Queue | None = None,
         env_action_queue: asyncio.Queue | None = None,
+        env_episode_start_queue: asyncio.Queue | None = None,
         pause_subtask: bool = False,
         export_demo: bool = True,
         motion_planner: Any | None = None,
@@ -631,6 +725,8 @@ class DataGenerator:
             success_term: success function to check if the task is successful
             env_reset_queue: queue to store environment IDs for reset
             env_action_queue: queue to store actions for each environment
+            env_episode_start_queue: queue that lets the main env loop finalize the
+                unrecorded reset/settle phase before recorder start.
             pause_subtask: whether to pause the subtask generation
             export_demo: whether to export the demo
             motion_planner: motion planner to use for motion planning
@@ -651,12 +747,26 @@ class DataGenerator:
         if self.env_cfg.datagen_config.use_skillgen and motion_planner is None:
             raise ValueError("motion_planner must be provided if use_skillgen is True")
 
-        # reset the env to create a new task demo instance
         env_id_tensor = torch.tensor([env_id], dtype=torch.int64, device=self.env.device)
-        self.env.recorder_manager.reset(env_ids=env_id_tensor)
-        await env_reset_queue.put(env_id)
-        await env_reset_queue.join()
+        # Reset and settle cloth before opening a new recorded episode so the exported
+        # trajectory starts from the first stable state, not from the warm-up preroll.
+        with self.env.recorder_manager.suspended_recording():
+            await env_reset_queue.put(env_id)
+            await env_reset_queue.join()
+            await self._settle_after_reset(env_id=env_id, env_action_queue=env_action_queue)
+            if env_episode_start_queue is not None:
+                await env_episode_start_queue.put(env_id)
+                await env_episode_start_queue.join()
+            else:
+                self._recenter_shoulder_pan_before_recording(env_id=env_id)
+
         new_initial_state = self.env.scene.get_state(is_relative=True)
+        self.env.recorder_manager.reset(env_ids=env_id_tensor)
+        self.env.recorder_manager.add_to_episodes(
+            "initial_state",
+            new_initial_state,
+            env_ids=env_id_tensor,
+        )
 
         # create runtime subtask constraint rules from subtask constraint configs
         runtime_subtask_constraints_dict = {}

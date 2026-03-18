@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import enum
 import os
+from contextlib import contextmanager
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -160,6 +161,7 @@ class RecorderManager(ManagerBase):
         """
         self._term_names: list[str] = list()
         self._terms: dict[str, RecorderTerm] = dict()
+        self._recording_enabled = True
 
         # Do nothing if cfg is None or an empty dict
         if not cfg:
@@ -293,6 +295,25 @@ class RecorderManager(ManagerBase):
         # nothing to log here
         return {}
 
+    @property
+    def recording_enabled(self) -> bool:
+        """Whether recorder callbacks actively add data to episode buffers."""
+        return self._recording_enabled
+
+    def set_recording_enabled(self, enabled: bool) -> None:
+        """Enable or disable recorder callbacks without clearing episode buffers."""
+        self._recording_enabled = bool(enabled)
+
+    @contextmanager
+    def suspended_recording(self):
+        """Temporarily disable recorder callbacks for reset or warm-up phases."""
+        previous_state = self._recording_enabled
+        self._recording_enabled = False
+        try:
+            yield
+        finally:
+            self._recording_enabled = previous_state
+
     def get_episode(self, env_id: int) -> EpisodeData:
         """Returns the episode data for the given environment id.
 
@@ -361,7 +382,7 @@ class RecorderManager(ManagerBase):
     def record_pre_step(self) -> None:
         """Trigger recorder terms for pre-step functions."""
         # Do nothing if no active recorder terms are provided
-        if len(self.active_terms) == 0:
+        if len(self.active_terms) == 0 or not self._recording_enabled:
             return
 
         for term in self._terms.values():
@@ -371,7 +392,7 @@ class RecorderManager(ManagerBase):
     def record_post_step(self) -> None:
         """Trigger recorder terms for post-step functions."""
         # Do nothing if no active recorder terms are provided
-        if len(self.active_terms) == 0:
+        if len(self.active_terms) == 0 or not self._recording_enabled:
             return
 
         for term in self._terms.values():
@@ -381,7 +402,7 @@ class RecorderManager(ManagerBase):
     def record_post_physics_decimation_step(self) -> None:
         """Trigger recorder terms for post-physics step functions in the decimation loop."""
         # Do nothing if no active recorder terms are provided
-        if len(self.active_terms) == 0:
+        if len(self.active_terms) == 0 or not self._recording_enabled:
             return
 
         for term in self._terms.values():
@@ -395,7 +416,7 @@ class RecorderManager(ManagerBase):
             env_ids: The environment ids in which a reset is triggered.
         """
         # Do nothing if no active recorder terms are provided
-        if len(self.active_terms) == 0:
+        if len(self.active_terms) == 0 or not self._recording_enabled:
             return
 
         if env_ids is None:
@@ -425,7 +446,7 @@ class RecorderManager(ManagerBase):
             env_ids: The environment ids in which a reset is triggered.
         """
         # Do nothing if no active recorder terms are provided
-        if len(self.active_terms) == 0:
+        if len(self.active_terms) == 0 or not self._recording_enabled:
             return
 
         for term in self._terms.values():
