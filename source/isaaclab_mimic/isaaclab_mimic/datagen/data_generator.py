@@ -106,7 +106,22 @@ def get_delta_pose_with_scheme(
         delta_pose: 4x4 delta pose
     """
     coord_transform_scheme = task_constraint["coordination_scheme"]
-    device = src_obj_pose.device
+    if coord_transform_scheme == SubTaskConstraintCoordinationScheme.REPLAY:
+        if src_obj_pose is not None:
+            device = src_obj_pose.device
+        elif cur_obj_pose is not None:
+            device = cur_obj_pose.device
+        else:
+            device = None
+        delta_pose = torch.eye(4, device=device)
+    else:
+        if src_obj_pose is None or cur_obj_pose is None:
+            raise ValueError(
+                "Object pose is required for non-REPLAY coordination schemes, "
+                f"but got src_obj_pose={src_obj_pose} and cur_obj_pose={cur_obj_pose}."
+            )
+        device = src_obj_pose.device
+
     if coord_transform_scheme == SubTaskConstraintCoordinationScheme.TRANSFORM:
         # IsaacLab versions differ: some expose get_delta_object_pose, some do not.
         if hasattr(PoseUtils, "get_delta_object_pose"):
@@ -117,8 +132,6 @@ def get_delta_pose_with_scheme(
     elif coord_transform_scheme == SubTaskConstraintCoordinationScheme.TRANSLATE:
         delta_pose = torch.eye(4, device=device)
         delta_pose[:3, 3] = cur_obj_pose[:3, 3] - src_obj_pose[:3, 3]
-    elif coord_transform_scheme == SubTaskConstraintCoordinationScheme.REPLAY:
-        delta_pose = torch.eye(4, device=device)
     else:
         raise ValueError(
             f"coordination coord_transform_scheme {coord_transform_scheme} not supported, only"
