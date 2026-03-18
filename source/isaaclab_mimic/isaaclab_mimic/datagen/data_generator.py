@@ -136,6 +136,8 @@ def get_delta_pose_with_scheme(
     elif coord_transform_scheme == SubTaskConstraintCoordinationScheme.TRANSLATE:
         delta_pose = torch.eye(4, device=device)
         delta_pose[:3, 3] = cur_obj_pose[:3, 3] - src_obj_pose[:3, 3]
+    elif coord_transform_scheme == SubTaskConstraintCoordinationScheme.REPLAY:
+        pass
     else:
         raise ValueError(
             f"coordination coord_transform_scheme {coord_transform_scheme} not supported, only"
