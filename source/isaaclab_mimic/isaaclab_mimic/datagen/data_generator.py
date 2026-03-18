@@ -106,6 +106,10 @@ def get_delta_pose_with_scheme(
         delta_pose: 4x4 delta pose
     """
     coord_transform_scheme = task_constraint["coordination_scheme"]
+    try:
+        coord_transform_scheme = SubTaskConstraintCoordinationScheme(int(coord_transform_scheme))
+    except Exception:
+        pass
     if coord_transform_scheme == SubTaskConstraintCoordinationScheme.REPLAY:
         if src_obj_pose is not None:
             device = src_obj_pose.device
