@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import numpy as np
+import torch
 
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 
@@ -103,6 +105,7 @@ class DataGenInfoPool:
         if "datagen_info" in ep_grp["obs"]:
             eef_pose = ep_grp["obs"]["datagen_info"]["eef_pose"]
             object_poses_dict = ep_grp["obs"]["datagen_info"]["object_pose"]
+            object_poses_dict = self._ensure_derived_object_poses(object_poses_dict)
             target_eef_pose = ep_grp["obs"]["datagen_info"]["target_eef_pose"]
             subtask_term_signals_dict = ep_grp["obs"]["datagen_info"]["subtask_term_signals"]
             # subtask_start_signals is optional
@@ -202,6 +205,55 @@ class DataGenInfoPool:
                     )
 
             self._subtask_boundaries[eef_name].append(eef_subtask_boundaries)
+
+    @staticmethod
+    def _ensure_derived_object_poses(object_poses_dict):
+        """Add derived garment center poses for older datasets that only stored six base keypoints."""
+        if not isinstance(object_poses_dict, dict):
+            return object_poses_dict
+
+        if "garment_lower_center" in object_poses_dict:
+            return object_poses_dict
+
+        if "garment_left_lower" not in object_poses_dict or "garment_right_lower" not in object_poses_dict:
+            return object_poses_dict
+
+        left_lower = object_poses_dict["garment_left_lower"]
+        right_lower = object_poses_dict["garment_right_lower"]
+
+        if torch.is_tensor(left_lower) or torch.is_tensor(right_lower):
+            if not torch.is_tensor(left_lower):
+                left_lower = torch.as_tensor(left_lower, dtype=torch.float32)
+            if not torch.is_tensor(right_lower):
+                right_lower = torch.as_tensor(
+                    right_lower,
+                    dtype=left_lower.dtype,
+                    device=left_lower.device,
+                )
+            else:
+                right_lower = right_lower.to(device=left_lower.device, dtype=left_lower.dtype)
+
+            if left_lower.shape != right_lower.shape or tuple(left_lower.shape[-2:]) != (4, 4):
+                return object_poses_dict
+
+            lower_center = torch.eye(
+                4,
+                dtype=left_lower.dtype,
+                device=left_lower.device,
+            ).expand(*left_lower.shape[:-2], 4, 4).clone()
+            lower_center[..., :3, 3] = 0.5 * (left_lower[..., :3, 3] + right_lower[..., :3, 3])
+        else:
+            left_lower = np.asarray(left_lower, dtype=np.float32)
+            right_lower = np.asarray(right_lower, dtype=np.float32)
+            if left_lower.shape != right_lower.shape or left_lower.shape[-2:] != (4, 4):
+                return object_poses_dict
+
+            lower_center = np.broadcast_to(np.eye(4, dtype=np.float32), left_lower.shape).copy()
+            lower_center[..., :3, 3] = 0.5 * (left_lower[..., :3, 3] + right_lower[..., :3, 3])
+
+        object_poses_with_centers = dict(object_poses_dict)
+        object_poses_with_centers["garment_lower_center"] = lower_center
+        return object_poses_with_centers
 
     def load_from_dataset_file(self, file_path, select_demo_keys: str | None = None):
         """

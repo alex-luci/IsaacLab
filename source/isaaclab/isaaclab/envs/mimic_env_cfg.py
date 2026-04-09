@@ -238,22 +238,22 @@ class SubTaskConstraintConfig:
             assert isinstance(constrained_subtask_ind, int)
             pre_condition_task_spec_key, pre_condition_subtask_ind = self.eef_subtask_constraint_tuple[0]
             assert isinstance(pre_condition_subtask_ind, int)
-            assert (
-                constrained_task_spec_key,
-                constrained_subtask_ind,
-            ) not in task_constraints_dict, "only one constraint per subtask allowed"
-            task_constraints_dict[(constrained_task_spec_key, constrained_subtask_ind)] = dict(
+            task_constraints_dict.setdefault(
+                (constrained_task_spec_key, constrained_subtask_ind), []
+            ).append(dict(
                 type=SubTaskConstraintType._SEQUENTIAL_LATTER,
                 pre_condition_task_spec_key=pre_condition_task_spec_key,
                 pre_condition_subtask_ind=pre_condition_subtask_ind,
                 min_time_diff=self.sequential_min_time_diff,
                 fulfilled=False,
-            )
-            task_constraints_dict[(pre_condition_task_spec_key, pre_condition_subtask_ind)] = dict(
+            ))
+            task_constraints_dict.setdefault(
+                (pre_condition_task_spec_key, pre_condition_subtask_ind), []
+            ).append(dict(
                 type=SubTaskConstraintType._SEQUENTIAL_FORMER,
                 constrained_task_spec_key=constrained_task_spec_key,
                 constrained_subtask_ind=constrained_subtask_ind,
-            )
+            ))
         elif self.constraint_type == SubTaskConstraintType.COORDINATION:
             constrained_task_spec_key, constrained_subtask_ind = self.eef_subtask_constraint_tuple[0]
             assert isinstance(constrained_subtask_ind, int)
@@ -261,11 +261,9 @@ class SubTaskConstraintConfig:
             assert isinstance(concurrent_subtask_ind, int)
             if self.coordination_scheme is None:
                 raise ValueError("Coordination scheme must be specified.")
-            assert (
-                constrained_task_spec_key,
-                constrained_subtask_ind,
-            ) not in task_constraints_dict, "only one constraint per subtask allowed"
-            task_constraints_dict[(constrained_task_spec_key, constrained_subtask_ind)] = dict(
+            task_constraints_dict.setdefault(
+                (constrained_task_spec_key, constrained_subtask_ind), []
+            ).append(dict(
                 concurrent_task_spec_key=concurrent_task_spec_key,
                 concurrent_subtask_ind=concurrent_subtask_ind,
                 type=SubTaskConstraintType.COORDINATION,
@@ -277,8 +275,10 @@ class SubTaskConstraintConfig:
                 coordination_scheme_rot_noise_scale=self.coordination_scheme_rot_noise_scale,
                 coordination_synchronize_start=self.coordination_synchronize_start,
                 synchronous_steps=None,  # to be calculated at runtime
-            )
-            task_constraints_dict[(concurrent_task_spec_key, concurrent_subtask_ind)] = dict(
+            ))
+            task_constraints_dict.setdefault(
+                (concurrent_task_spec_key, concurrent_subtask_ind), []
+            ).append(dict(
                 concurrent_task_spec_key=constrained_task_spec_key,
                 concurrent_subtask_ind=constrained_subtask_ind,
                 type=SubTaskConstraintType.COORDINATION,
@@ -290,7 +290,7 @@ class SubTaskConstraintConfig:
                 coordination_scheme_rot_noise_scale=self.coordination_scheme_rot_noise_scale,
                 coordination_synchronize_start=self.coordination_synchronize_start,
                 synchronous_steps=None,  # to be calculated at runtime
-            )
+            ))
         else:
             raise ValueError("Constraint type not supported.")
 

@@ -32,6 +32,35 @@ from isaaclab_mimic.datagen.waypoint import MultiWaypoint, Waypoint, WaypointSeq
 from .datagen_info_pool import DataGenInfoPool
 
 
+def _find_constraint(
+    constraints_dict: dict,
+    eef_name: str,
+    subtask_ind: int,
+    constraint_type: SubTaskConstraintType,
+) -> dict | None:
+    """Find the first constraint of *constraint_type* for (eef_name, subtask_ind)."""
+    for c in constraints_dict.get((eef_name, subtask_ind), []):
+        if c["type"] == constraint_type:
+            return c
+    return None
+
+
+def _coerce_pose_tensors_to_common_device(*poses: torch.Tensor | None) -> tuple[torch.Tensor | None, ...]:
+    """Move pose tensors to a shared device so mixed CPU/CUDA datasets can still be transformed."""
+    devices = [pose.device for pose in poses if torch.is_tensor(pose)]
+    if not devices:
+        return poses
+
+    target_device = next((device for device in devices if device.type == "cuda"), devices[0])
+    coerced = []
+    for pose in poses:
+        if pose is None:
+            coerced.append(None)
+            continue
+        coerced.append(torch.as_tensor(pose, device=target_device, dtype=torch.float32))
+    return tuple(coerced)
+
+
 def transform_source_data_segment_using_delta_object_pose(
     src_eef_poses: torch.Tensor,
     delta_obj_pose: torch.Tensor,
@@ -48,6 +77,7 @@ def transform_source_data_segment_using_delta_object_pose(
     Returns:
         transformed_eef_poses: transformed pose sequence (shape [T, 4, 4])
     """
+    src_eef_poses, delta_obj_pose = _coerce_pose_tensors_to_common_device(src_eef_poses, delta_obj_pose)
     return PoseUtils.pose_in_A_to_pose_in_B(
         pose_in_A=src_eef_poses,
         pose_A_in_B=delta_obj_pose[None],
@@ -74,6 +104,9 @@ def transform_source_data_segment_using_object_pose(
     Returns:
         transformed_eef_poses: transformed pose sequence (shape [T, 4, 4])
     """
+    obj_pose, src_eef_poses, src_obj_pose = _coerce_pose_tensors_to_common_device(
+        obj_pose, src_eef_poses, src_obj_pose
+    )
 
     # Transform source end effector poses to be relative to source object frame
     src_eef_poses_rel_obj = PoseUtils.pose_in_A_to_pose_in_B(
@@ -105,6 +138,7 @@ def get_delta_pose_with_scheme(
     Returns:
         delta_pose: 4x4 delta pose
     """
+    src_obj_pose, cur_obj_pose = _coerce_pose_tensors_to_common_device(src_obj_pose, cur_obj_pose)
     coord_transform_scheme = task_constraint["coordination_scheme"]
     try:
         coord_transform_scheme = SubTaskConstraintCoordinationScheme(int(coord_transform_scheme))
@@ -496,39 +530,38 @@ class DataGenerator:
 
         use_delta_transform = None
         coord_transform_scheme = None
-        if (eef_name, subtask_ind) in runtime_subtask_constraints_dict:
-            if runtime_subtask_constraints_dict[(eef_name, subtask_ind)]["type"] == SubTaskConstraintType.COORDINATION:
-                # Avoid selecting source demo if it has already been selected by the concurrent task
-                concurrent_task_spec_key = runtime_subtask_constraints_dict[(eef_name, subtask_ind)][
-                    "concurrent_task_spec_key"
-                ]
-                concurrent_subtask_ind = runtime_subtask_constraints_dict[(eef_name, subtask_ind)][
-                    "concurrent_subtask_ind"
-                ]
-                concurrent_selected_src_ind = runtime_subtask_constraints_dict[
-                    (concurrent_task_spec_key, concurrent_subtask_ind)
-                ]["selected_src_demo_ind"]
-                if concurrent_selected_src_ind is not None:
-                    # The concurrent task has started, so we should use the same source demo
-                    selected_src_demo_inds[eef_name] = concurrent_selected_src_ind
-                    need_source_demo_selection = False
-                    # This transform is set at after the first data generation iteration/first
-                    # run of the main while loop
-                    use_delta_transform = runtime_subtask_constraints_dict[
-                        (concurrent_task_spec_key, concurrent_subtask_ind)
-                    ]["transform"]
-                else:
-                    assert "transform" not in runtime_subtask_constraints_dict[(eef_name, subtask_ind)], (
-                        "transform should not be set for concurrent task"
+        reused_from_coordination = False
+        coord_constraint = _find_constraint(
+            runtime_subtask_constraints_dict, eef_name, subtask_ind, SubTaskConstraintType.COORDINATION
+        )
+        if coord_constraint is not None:
+            # Avoid selecting source demo if it has already been selected by the concurrent task
+            concurrent_task_spec_key = coord_constraint["concurrent_task_spec_key"]
+            concurrent_subtask_ind = coord_constraint["concurrent_subtask_ind"]
+            concurrent_coord = _find_constraint(
+                runtime_subtask_constraints_dict,
+                concurrent_task_spec_key, concurrent_subtask_ind,
+                SubTaskConstraintType.COORDINATION,
+            )
+            concurrent_selected_src_ind = concurrent_coord["selected_src_demo_ind"] if concurrent_coord else None
+            if concurrent_selected_src_ind is not None:
+                # The concurrent task has started, so we should use the same source demo
+                selected_src_demo_inds[eef_name] = concurrent_selected_src_ind
+                need_source_demo_selection = False
+                reused_from_coordination = True
+                # This transform is set at after the first data generation iteration/first
+                # run of the main while loop
+                use_delta_transform = concurrent_coord["transform"]
+            else:
+                assert "transform" not in coord_constraint, (
+                    "transform should not be set for concurrent task"
+                )
+                # Need to transform demo according to scheme
+                coord_transform_scheme = coord_constraint["coordination_scheme"]
+                if coord_transform_scheme != SubTaskConstraintCoordinationScheme.REPLAY:
+                    assert subtask_object_name is not None, (
+                        f"object reference should not be None for {coord_transform_scheme} coordination scheme"
                     )
-                    # Need to transform demo according to scheme
-                    coord_transform_scheme = runtime_subtask_constraints_dict[(eef_name, subtask_ind)][
-                        "coordination_scheme"
-                    ]
-                    if coord_transform_scheme != SubTaskConstraintCoordinationScheme.REPLAY:
-                        assert subtask_object_name is not None, (
-                            f"object reference should not be None for {coord_transform_scheme} coordination scheme"
-                        )
 
         if need_source_demo_selection:
             selected_src_demo_inds[eef_name] = self.select_source_demo(
@@ -543,6 +576,21 @@ class DataGenerator:
 
         assert selected_src_demo_inds[eef_name] is not None
         selected_src_demo_ind = selected_src_demo_inds[eef_name]
+        source_episode_names = getattr(self.src_demo_datagen_info_pool, "episode_names", None)
+        source_episode_name = None
+        if isinstance(source_episode_names, list) and 0 <= selected_src_demo_ind < len(source_episode_names):
+            source_episode_name = source_episode_names[selected_src_demo_ind]
+
+        selection_mode = "reused_coordination" if reused_from_coordination else (
+            "selected" if need_source_demo_selection else "reused_arm_cache"
+        )
+        if bool(getattr(self, "_log_source_demo_selection", False)):
+            print(
+                "[Mimic Selection] "
+                f"env={env_id} arm={eef_name} subtask={subtask_ind} mode={selection_mode} "
+                f"demo_index={selected_src_demo_ind}"
+                + (f" demo_name={source_episode_name}" if source_episode_name is not None else "")
+            )
 
         if not self.env_cfg.datagen_config.generation_select_src_per_arm and need_source_demo_selection:
             for itrated_eef_name in self.env_cfg.subtask_configs.keys():
@@ -551,26 +599,20 @@ class DataGenerator:
         # Selected subtask segment time indices
         selected_src_subtask_boundary = all_randomized_subtask_boundaries[eef_name][selected_src_demo_ind, subtask_ind]
 
-        if (eef_name, subtask_ind) in runtime_subtask_constraints_dict:
-            if runtime_subtask_constraints_dict[(eef_name, subtask_ind)]["type"] == SubTaskConstraintType.COORDINATION:
-                # Store selected source demo ind for concurrent task
-                runtime_subtask_constraints_dict[(eef_name, subtask_ind)]["selected_src_demo_ind"] = (
-                    selected_src_demo_ind
-                )
-                concurrent_task_spec_key = runtime_subtask_constraints_dict[(eef_name, subtask_ind)][
-                    "concurrent_task_spec_key"
-                ]
-                concurrent_subtask_ind = runtime_subtask_constraints_dict[(eef_name, subtask_ind)][
-                    "concurrent_subtask_ind"
-                ]
-                concurrent_src_subtask_inds = all_randomized_subtask_boundaries[concurrent_task_spec_key][
-                    selected_src_demo_ind, concurrent_subtask_ind
-                ]
-                subtask_len = selected_src_subtask_boundary[1] - selected_src_subtask_boundary[0]
-                concurrent_subtask_len = concurrent_src_subtask_inds[1] - concurrent_src_subtask_inds[0]
-                runtime_subtask_constraints_dict[(eef_name, subtask_ind)]["synchronous_steps"] = min(
-                    subtask_len, concurrent_subtask_len
-                )
+        coord_constraint_post = _find_constraint(
+            runtime_subtask_constraints_dict, eef_name, subtask_ind, SubTaskConstraintType.COORDINATION
+        )
+        if coord_constraint_post is not None:
+            # Store selected source demo ind for concurrent task
+            coord_constraint_post["selected_src_demo_ind"] = selected_src_demo_ind
+            concurrent_task_spec_key = coord_constraint_post["concurrent_task_spec_key"]
+            concurrent_subtask_ind = coord_constraint_post["concurrent_subtask_ind"]
+            concurrent_src_subtask_inds = all_randomized_subtask_boundaries[concurrent_task_spec_key][
+                selected_src_demo_ind, concurrent_subtask_ind
+            ]
+            subtask_len = selected_src_subtask_boundary[1] - selected_src_subtask_boundary[0]
+            concurrent_subtask_len = concurrent_src_subtask_inds[1] - concurrent_src_subtask_inds[0]
+            coord_constraint_post["synchronous_steps"] = min(subtask_len, concurrent_subtask_len)
 
         # Get subtask segment, consisting of the sequence of robot eef poses, target poses, gripper actions
         src_ep_datagen_info = self.src_demo_datagen_info_pool.datagen_infos[selected_src_demo_ind]
@@ -617,12 +659,12 @@ class DataGenerator:
                 delta_obj_pose = get_delta_pose_with_scheme(
                     src_subtask_object_pose,
                     subtask_object_pose,
-                    runtime_subtask_constraints_dict[(eef_name, subtask_ind)],
+                    coord_constraint,
                 )
                 transformed_eef_poses = transform_source_data_segment_using_delta_object_pose(
                     src_eef_poses, delta_obj_pose
                 )
-                runtime_subtask_constraints_dict[(eef_name, subtask_ind)]["transform"] = delta_obj_pose
+                coord_constraint["transform"] = delta_obj_pose
             else:
                 if subtask_object_name is not None:
                     transformed_eef_poses = transform_source_data_segment_using_object_pose(
@@ -788,9 +830,12 @@ class DataGenerator:
         )
 
         # create runtime subtask constraint rules from subtask constraint configs
+        # Each key maps to a list of constraint dicts so a subtask can have
+        # multiple roles (e.g. SEQUENTIAL_FORMER + SEQUENTIAL_LATTER).
         runtime_subtask_constraints_dict = {}
         for subtask_constraint in self.env_cfg.task_constraint_configs:
-            runtime_subtask_constraints_dict.update(subtask_constraint.generate_runtime_subtask_constraints())
+            for key, constraint_list in subtask_constraint.generate_runtime_subtask_constraints().items():
+                runtime_subtask_constraints_dict.setdefault(key, []).extend(constraint_list)
 
         # save generated data in these variables
         generated_states = []
@@ -943,8 +988,7 @@ class DataGenerator:
                 # Handle constraints
                 step_ind = current_eef_subtask_step_indices[eef_name]
                 subtask_ind = current_eef_subtask_indices[eef_name]
-                if (eef_name, subtask_ind) in runtime_subtask_constraints_dict:
-                    task_constraint = runtime_subtask_constraints_dict[(eef_name, subtask_ind)]
+                for task_constraint in runtime_subtask_constraints_dict.get((eef_name, subtask_ind), []):
                     if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER:
                         min_time_diff = task_constraint["min_time_diff"]
                         if not task_constraint["fulfilled"]:
@@ -961,9 +1005,12 @@ class DataGenerator:
                         synchronous_steps = task_constraint["synchronous_steps"]
                         concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
                         concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
-                        concurrent_task_fulfilled = runtime_subtask_constraints_dict[
-                            (concurrent_task_spec_key, concurrent_subtask_ind)
-                        ]["fulfilled"]
+                        concurrent_coord = _find_constraint(
+                            runtime_subtask_constraints_dict,
+                            concurrent_task_spec_key, concurrent_subtask_ind,
+                            SubTaskConstraintType.COORDINATION,
+                        )
+                        concurrent_task_fulfilled = concurrent_coord["fulfilled"] if concurrent_coord else True
 
                         if (
                             task_constraint["coordination_synchronize_start"]
@@ -979,9 +1026,8 @@ class DataGenerator:
                                 and step_ind >= len(current_eef_subtask_trajectories[eef_name]) - synchronous_steps
                             ):
                                 # Trigger concurrent task
-                                runtime_subtask_constraints_dict[(concurrent_task_spec_key, concurrent_subtask_ind)][
-                                    "fulfilled"
-                                ] = True
+                                if concurrent_coord is not None:
+                                    concurrent_coord["fulfilled"] = True
 
                             if not task_constraint["fulfilled"]:
                                 if step_ind >= len(current_eef_subtask_trajectories[eef_name]) - synchronous_steps:
@@ -1066,24 +1112,32 @@ class DataGenerator:
                 if current_eef_subtask_step_indices[eef_name] == len(
                     current_eef_subtask_trajectories[eef_name]
                 ):  # Subtask done
-                    if (eef_name, subtask_ind) in runtime_subtask_constraints_dict:
-                        task_constraint = runtime_subtask_constraints_dict[(eef_name, subtask_ind)]
+                    for task_constraint in runtime_subtask_constraints_dict.get((eef_name, subtask_ind), []):
                         if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_FORMER:
                             constrained_task_spec_key = task_constraint["constrained_task_spec_key"]
                             constrained_subtask_ind = task_constraint["constrained_subtask_ind"]
-                            runtime_subtask_constraints_dict[(constrained_task_spec_key, constrained_subtask_ind)][
-                                "fulfilled"
-                            ] = True
+                            # Fulfill the corresponding SEQUENTIAL_LATTER constraint(s)
+                            for latter_c in runtime_subtask_constraints_dict.get(
+                                (constrained_task_spec_key, constrained_subtask_ind), []
+                            ):
+                                if (
+                                    latter_c["type"] == SubTaskConstraintType._SEQUENTIAL_LATTER
+                                    and latter_c["pre_condition_task_spec_key"] == eef_name
+                                    and latter_c["pre_condition_subtask_ind"] == subtask_ind
+                                ):
+                                    latter_c["fulfilled"] = True
                         elif task_constraint["type"] == SubTaskConstraintType.COORDINATION:
                             concurrent_task_spec_key = task_constraint["concurrent_task_spec_key"]
                             concurrent_subtask_ind = task_constraint["concurrent_subtask_ind"]
-                            # Concurrent_task_spec_idx = task_spec_keys.index(concurrent_task_spec_key)
                             task_constraint["finished"] = True
                             # Check if concurrent task has been finished
-                            assert (
-                                runtime_subtask_constraints_dict[(concurrent_task_spec_key, concurrent_subtask_ind)][
-                                    "finished"
-                                ]
+                            concurrent_coord = _find_constraint(
+                                runtime_subtask_constraints_dict,
+                                concurrent_task_spec_key, concurrent_subtask_ind,
+                                SubTaskConstraintType.COORDINATION,
+                            )
+                            assert concurrent_coord is None or (
+                                concurrent_coord["finished"]
                                 or current_eef_subtask_step_indices[concurrent_task_spec_key]
                                 >= len(current_eef_subtask_trajectories[concurrent_task_spec_key]) - 1
                             )

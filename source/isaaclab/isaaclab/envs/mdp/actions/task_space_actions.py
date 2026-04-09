@@ -211,6 +211,9 @@ class DifferentialInverseKinematicsAction(ActionTerm):
             joint_pos_des = self._ik_controller.compute(ee_pos_curr, ee_quat_curr, jacobian, joint_pos)
         else:
             joint_pos_des = joint_pos.clone()
+        # clamp to soft joint limits to prevent motor saturation at hard stops
+        joint_limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids, :]
+        joint_pos_des = torch.clamp(joint_pos_des, min=joint_limits[..., 0], max=joint_limits[..., 1])
         # set the joint position command
         self._asset.set_joint_position_target(joint_pos_des, self._joint_ids)
 
