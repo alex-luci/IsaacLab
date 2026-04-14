@@ -673,9 +673,7 @@ class DataGenerator:
                         src_subtask_object_pose,
                     )
                 else:
-                    print(f"skipping transformation for {subtask_object_name}")
-
-                    # Skip transformation if no reference object is provided
+                    # No reference object — replay source trajectory without transformation.
                     transformed_eef_poses = src_eef_poses
 
         # Construct trajectory for the transformed segment.
