@@ -827,6 +827,18 @@ class DataGenerator:
             env_ids=env_id_tensor,
         )
 
+        # Record garment initial pose (position + euler angles in degrees).
+        garment_obj = getattr(self.env, "object", None)
+        if garment_obj is not None and hasattr(garment_obj, "reset_pose"):
+            garment_pose = torch.as_tensor(
+                garment_obj.reset_pose, dtype=torch.float32, device=self.env.device,
+            ).unsqueeze(0)
+            self.env.recorder_manager.add_to_episodes(
+                "initial_state/garment_initial_pose",
+                garment_pose,
+                env_ids=env_id_tensor,
+            )
+
         # create runtime subtask constraint rules from subtask constraint configs
         # Each key maps to a list of constraint dicts so a subtask can have
         # multiple roles (e.g. SEQUENTIAL_FORMER + SEQUENTIAL_LATTER).
@@ -849,7 +861,10 @@ class DataGenerator:
         next_eef_subtask_trajectories_after_motion = {}
         current_eef_subtask_step_indices = {}
         eef_subtasks_done = {}
+        # Track which source demo was selected for each (arm, subtask).
+        source_demo_selections: dict[str, list[int]] = {}
         for eef_name in self.env_cfg.subtask_configs.keys():
+            source_demo_selections[eef_name] = []
             current_eef_selected_src_demo_indices[eef_name] = None
             current_eef_subtask_trajectories[eef_name] = []  # type of list of Waypoint
             current_eef_subtask_indices[eef_name] = 0
@@ -893,6 +908,10 @@ class DataGenerator:
                                 randomized_subtask_boundaries,
                                 runtime_subtask_constraints_dict,
                                 current_eef_selected_src_demo_indices,  # updated in the method
+                            )
+                            # Track which source demo was chosen for this subtask.
+                            source_demo_selections[eef_name].append(
+                                int(current_eef_selected_src_demo_indices[eef_name])
                             )
                             # With skillgen, use a motion planner to transition between subtasks.
                             if self.env_cfg.datagen_config.use_skillgen:
@@ -1166,6 +1185,15 @@ class DataGenerator:
         # Merge numpy arrays
         if len(generated_actions) > 0:
             generated_actions = torch.cat(generated_actions, dim=0)
+
+        # Record which source demo was used per arm per subtask.
+        for eef_name, selections in source_demo_selections.items():
+            if selections:
+                self.env.recorder_manager.add_to_episodes(
+                    f"source_demo_indices/{eef_name}",
+                    torch.tensor([selections], dtype=torch.int64, device=self.env.device),
+                    env_ids=env_id_tensor,
+                )
 
         # Set success to the recorded episode data and export to file
         self.env.recorder_manager.set_success_to_episodes(
