@@ -249,13 +249,13 @@ class NearestNeighborMultiKeypointStrategy(SelectionStrategy):
         for kp_name in keypoint_names:
             if kp_name not in all_object_poses:
                 continue
-            current_pos = all_object_poses[kp_name][:3, 3]
+            current_pos = all_object_poses[kp_name][:3, 3].cpu()
 
             for i, di in enumerate(src_subtask_datagen_infos):
                 if di.object_poses is None or kp_name not in di.object_poses:
                     total_dists[i] += float("inf")
                     continue
-                src_pos = di.object_poses[kp_name][0, :3, 3]
+                src_pos = di.object_poses[kp_name][0, :3, 3].cpu()
                 total_dists[i] += torch.sqrt(((current_pos - src_pos) ** 2).sum())
 
         nn_k = min(nn_k, n_src)
