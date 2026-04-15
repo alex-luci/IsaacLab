@@ -112,6 +112,7 @@ class RandomStrategy(SelectionStrategy):
         eef_pose,
         object_pose,
         src_subtask_datagen_infos,
+        **kwargs,
     ):
         """
         Selects source demonstration index using the current robot pose, relevant object pose
@@ -150,6 +151,7 @@ class NearestNeighborObjectStrategy(SelectionStrategy):
         pos_weight=1.0,
         rot_weight=1.0,
         nn_k=3,
+        **kwargs,
     ):
         """
         Selects source demonstration index using the current robot pose, relevant object pose
@@ -281,6 +283,7 @@ class NearestNeighborRobotDistanceStrategy(SelectionStrategy):
         pos_weight=1.0,
         rot_weight=1.0,
         nn_k=3,
+        **kwargs,
     ):
         """
         Selects source demonstration index using the current robot pose, relevant object pose
