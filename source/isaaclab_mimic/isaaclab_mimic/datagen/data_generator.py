@@ -403,6 +403,7 @@ class DataGenerator:
         subtask_object_name: str,
         selection_strategy_name: str,
         selection_strategy_kwargs: dict | None = None,
+        all_object_poses: dict | None = None,
     ) -> int:
         """Helper method to run source subtask segment selection.
 
@@ -415,6 +416,7 @@ class DataGenerator:
             subtask_object_name: name of reference object for this subtask
             selection_strategy_name: name of selection strategy
             selection_strategy_kwargs: extra kwargs for running selection strategy
+            all_object_poses: dict mapping all object names to their current 4x4 poses
 
         Returns:
             The selected source demo index
@@ -434,20 +436,18 @@ class DataGenerator:
             subtask_start_ind = src_demo_current_subtask_boundaries[i][0]
             subtask_end_ind = src_demo_current_subtask_boundaries[i][1]
 
-            # Get subtask segment using indices
+            # Get subtask segment using indices — include ALL object poses
+            # so multi-keypoint selection strategies can access any keypoint.
+            src_subtask_object_poses = None
+            if src_ep_datagen_info.object_poses is not None:
+                src_subtask_object_poses = {
+                    obj_name: obj_poses[subtask_start_ind:subtask_end_ind]
+                    for obj_name, obj_poses in src_ep_datagen_info.object_poses.items()
+                }
             src_subtask_datagen_infos.append(
                 DatagenInfo(
                     eef_pose=src_ep_datagen_info.eef_pose[eef_name][subtask_start_ind:subtask_end_ind],
-                    # Only include object pose for relevant object in subtask
-                    object_poses=(
-                        {
-                            subtask_object_name: src_ep_datagen_info.object_poses[subtask_object_name][
-                                subtask_start_ind:subtask_end_ind
-                            ]
-                        }
-                        if (subtask_object_name is not None)
-                        else None
-                    ),
+                    object_poses=src_subtask_object_poses,
                     # Subtask termination signal is unused
                     subtask_term_signals=None,
                     target_eef_pose=src_ep_datagen_info.target_eef_pose[eef_name][subtask_start_ind:subtask_end_ind],
@@ -465,6 +465,7 @@ class DataGenerator:
             eef_pose=eef_pose,
             object_pose=object_pose,
             src_subtask_datagen_infos=src_subtask_datagen_infos,
+            all_object_poses=all_object_poses,
             **selection_strategy_kwargs,
         )
 
@@ -564,6 +565,15 @@ class DataGenerator:
                     )
 
         if need_source_demo_selection:
+            # Gather all current object poses for multi-keypoint selection strategies.
+            try:
+                all_current_object_poses = self.env.get_object_poses(env_ids=[env_id])
+                all_current_object_poses = {
+                    k: v[0] if v.dim() > 2 else v
+                    for k, v in all_current_object_poses.items()
+                }
+            except Exception:
+                all_current_object_poses = None
             selected_src_demo_inds[eef_name] = self.select_source_demo(
                 eef_name=eef_name,
                 eef_pose=self.env.get_robot_eef_pose(env_ids=[env_id], eef_name=eef_name)[0],
@@ -572,6 +582,7 @@ class DataGenerator:
                 subtask_object_name=subtask_object_name,
                 selection_strategy_name=self.env_cfg.subtask_configs[eef_name][subtask_ind].selection_strategy,
                 selection_strategy_kwargs=self.env_cfg.subtask_configs[eef_name][subtask_ind].selection_strategy_kwargs,
+                all_object_poses=all_current_object_poses,
             )
 
         assert selected_src_demo_inds[eef_name] is not None

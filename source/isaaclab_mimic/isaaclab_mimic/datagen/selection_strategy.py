@@ -210,6 +210,59 @@ class NearestNeighborObjectStrategy(SelectionStrategy):
         return top_k_neighbors_in_order[rand_k]
 
 
+class NearestNeighborMultiKeypointStrategy(SelectionStrategy):
+    """Pick source demonstration that minimizes the sum of position distances
+    across multiple keypoint pairs between current scene and source demo."""
+
+    NAME = "nearest_neighbor_multi_keypoint"
+
+    def select_source_demo(
+        self,
+        eef_pose,
+        object_pose,
+        src_subtask_datagen_infos,
+        keypoint_names=None,
+        all_object_poses=None,
+        nn_k=1,
+        **kwargs,
+    ):
+        """Select the source demo with the smallest combined keypoint distance.
+
+        Args:
+            eef_pose: current 4x4 eef pose (unused)
+            object_pose: current 4x4 object pose for the primary object_ref
+            src_subtask_datagen_infos: list of DatagenInfo per source demo
+            keypoint_names: list of keypoint names to compare (e.g.
+                ["garment_left_middle", "garment_left_upper"])
+            all_object_poses: dict mapping all keypoint names to current 4x4 poses
+            nn_k: pick from top-k (default 1 = best match)
+        """
+        if not keypoint_names or all_object_poses is None:
+            raise ValueError(
+                "nearest_neighbor_multi_keypoint requires 'keypoint_names' list "
+                "and 'all_object_poses' dict."
+            )
+
+        n_src = len(src_subtask_datagen_infos)
+        total_dists = torch.zeros(n_src)
+
+        for kp_name in keypoint_names:
+            if kp_name not in all_object_poses:
+                continue
+            current_pos = all_object_poses[kp_name][:3, 3]
+
+            for i, di in enumerate(src_subtask_datagen_infos):
+                if di.object_poses is None or kp_name not in di.object_poses:
+                    total_dists[i] += float("inf")
+                    continue
+                src_pos = di.object_poses[kp_name][0, :3, 3]
+                total_dists[i] += torch.sqrt(((current_pos - src_pos) ** 2).sum())
+
+        nn_k = min(nn_k, n_src)
+        top_k = torch.argsort(total_dists)[:nn_k]
+        return top_k[torch.randint(0, nn_k, (1,)).item()].item()
+
+
 class NearestNeighborRobotDistanceStrategy(SelectionStrategy):
     """
     Pick source demonstration to be the one that minimizes the distance the robot
