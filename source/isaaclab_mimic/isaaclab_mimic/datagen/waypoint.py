@@ -313,10 +313,12 @@ class WaypointTrajectory:
             target_for_interpolation = other_first[0]
 
             if need_interp:
-                # interpolation segment
+                # interpolation segment — hold previous subtask's final gripper value so the
+                # gripper does not snap to the next subtask's gripper command while the arm
+                # is still interpolating between subtasks.
                 self.add_waypoint_sequence_for_target_pose(
                     pose=target_for_interpolation.pose,
-                    gripper_action=target_for_interpolation.gripper_action,
+                    gripper_action=self.last_waypoint.gripper_action,
                     num_steps=num_steps_interp,
                     action_noise=action_noise,
                     skip_interpolation=False,

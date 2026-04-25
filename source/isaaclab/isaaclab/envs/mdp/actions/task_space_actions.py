@@ -101,6 +101,7 @@ class DifferentialInverseKinematicsAction(ActionTerm):
         # create tensors for raw and processed actions
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._processed_actions = torch.zeros_like(self.raw_actions)
+        self._last_joint_pos_des = torch.zeros(self.num_envs, self._num_joints, device=self.device)
 
         # save the scale as tensors
         self._scale = torch.zeros((self.num_envs, self.action_dim), device=self.device)
@@ -201,24 +202,27 @@ class DifferentialInverseKinematicsAction(ActionTerm):
         # set command into controller
         self._ik_controller.set_command(self._processed_actions, ee_pos_curr, ee_quat_curr)
 
-    def apply_actions(self):
-        # obtain quantities from simulation
+    def compute_joint_position_target(self) -> torch.Tensor:
+        """Compute the current IK joint target for the already-processed command."""
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        # compute the delta in joint-space
         if ee_quat_curr.norm() != 0:
             jacobian = self._compute_frame_jacobian()
             joint_pos_des = self._ik_controller.compute(ee_pos_curr, ee_quat_curr, jacobian, joint_pos)
         else:
             joint_pos_des = joint_pos.clone()
-        # clamp to soft joint limits to prevent motor saturation at hard stops
         joint_limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids, :]
-        joint_pos_des = torch.clamp(joint_pos_des, min=joint_limits[..., 0], max=joint_limits[..., 1])
+        return torch.clamp(joint_pos_des, min=joint_limits[..., 0], max=joint_limits[..., 1])
+
+    def apply_actions(self):
+        joint_pos_des = self.compute_joint_position_target()
+        self._last_joint_pos_des[:] = joint_pos_des
         # set the joint position command
         self._asset.set_joint_position_target(joint_pos_des, self._joint_ids)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self._raw_actions[env_ids] = 0.0
+        self._last_joint_pos_des[env_ids] = 0.0
 
     """
     Helper functions.

@@ -265,6 +265,130 @@ class NearestNeighborMultiKeypointStrategy(SelectionStrategy):
         return top_k[torch.randint(0, nn_k, (1,)).item()].item()
 
 
+class NearestNeighborAllKeypointsStrategy(SelectionStrategy):
+    """Pick source demo that minimizes the sum of position distances across
+    all six garment keypoints (left/right × middle/upper/lower).
+
+    Intended for use on the *first* subtask when
+    ``generation_select_src_per_subtask = False``: a single source demo is
+    chosen for the whole episode, and this strategy picks the demo whose full
+    garment layout (all six reference keypoints) best matches the current
+    scene — not just the three keypoints relevant to one subtask.
+
+    The default keypoint list covers the full set of garment check_points used
+    as virtual object references by the fold-cloth environment; callers may
+    still override ``keypoint_names`` explicitly via
+    ``selection_strategy_kwargs``.
+    """
+
+    NAME = "nearest_neighbor_all_keypoints"
+
+    DEFAULT_KEYPOINT_NAMES = (
+        "garment_left_middle",
+        "garment_left_upper",
+        "garment_left_lower",
+        "garment_right_middle",
+        "garment_right_upper",
+        "garment_right_lower",
+    )
+
+    def select_source_demo(
+        self,
+        eef_pose,
+        object_pose,
+        src_subtask_datagen_infos,
+        keypoint_names=None,
+        all_object_poses=None,
+        nn_k=1,
+        **kwargs,
+    ):
+        if all_object_poses is None:
+            raise ValueError(
+                "nearest_neighbor_all_keypoints requires 'all_object_poses' dict."
+            )
+        if not keypoint_names:
+            keypoint_names = list(self.DEFAULT_KEYPOINT_NAMES)
+
+        n_src = len(src_subtask_datagen_infos)
+        total_dists = torch.zeros(n_src)
+
+        for kp_name in keypoint_names:
+            if kp_name not in all_object_poses:
+                continue
+            current_pos = all_object_poses[kp_name][:3, 3].cpu()
+
+            for i, di in enumerate(src_subtask_datagen_infos):
+                if di.object_poses is None or kp_name not in di.object_poses:
+                    total_dists[i] += float("inf")
+                    continue
+                src_pos = di.object_poses[kp_name][0, :3, 3].cpu()
+                total_dists[i] += torch.sqrt(((current_pos - src_pos) ** 2).sum())
+
+        nn_k = min(nn_k, n_src)
+        top_k = torch.argsort(total_dists)[:nn_k]
+        return top_k[torch.randint(0, nn_k, (1,)).item()].item()
+
+
+class SourceFromSubtaskStrategy(SelectionStrategy):
+    """Reuse the source demo already selected for a named prior subtask.
+
+    The ``source_subtask`` kwarg names a previously executed subtask via its
+    ``subtask_term_signal``.  The index of that subtask within the arm's
+    ``subtask_configs`` list is looked up and the source demo chosen for it is
+    returned, so both subtasks share the same source episode.
+
+    Requirements:
+        * The referenced subtask must precede the current one for this arm
+          (its selection must already be in ``source_demo_selections[eef_name]``).
+        * The data generator must forward ``eef_name``, ``source_demo_selections``
+          and ``subtask_configs`` kwargs (see ``DataGenerator.select_source_demo``).
+    """
+
+    NAME = "source_from_subtask"
+
+    def select_source_demo(
+        self,
+        eef_pose,
+        object_pose,
+        src_subtask_datagen_infos,
+        source_subtask=None,
+        eef_name=None,
+        source_demo_selections=None,
+        subtask_configs=None,
+        **kwargs,
+    ):
+        if source_subtask is None:
+            raise ValueError(
+                "source_from_subtask requires a 'source_subtask' kwarg naming "
+                "the prior subtask's subtask_term_signal to reuse the source from"
+            )
+        if source_demo_selections is None or eef_name is None or subtask_configs is None:
+            raise ValueError(
+                "source_from_subtask requires the data generator to forward "
+                "'eef_name', 'source_demo_selections' and 'subtask_configs'."
+            )
+
+        target_index = None
+        for idx, cfg in enumerate(subtask_configs):
+            if getattr(cfg, "subtask_term_signal", None) == source_subtask:
+                target_index = idx
+                break
+        if target_index is None:
+            raise ValueError(
+                f"source_from_subtask: no subtask with subtask_term_signal="
+                f"{source_subtask!r} found for arm {eef_name!r}"
+            )
+
+        prior = source_demo_selections.get(eef_name, [])
+        if target_index >= len(prior):
+            raise ValueError(
+                f"source_from_subtask: referenced subtask {source_subtask!r} "
+                f"(index {target_index}) for arm {eef_name!r} has not been "
+                f"generated yet (only {len(prior)} prior selections available)"
+            )
+        return int(prior[target_index])
+
+
 class NearestNeighborRobotDistanceStrategy(SelectionStrategy):
     """
     Pick source demonstration to be the one that minimizes the distance the robot

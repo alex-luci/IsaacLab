@@ -404,6 +404,7 @@ class DataGenerator:
         selection_strategy_name: str,
         selection_strategy_kwargs: dict | None = None,
         all_object_poses: dict | None = None,
+        source_demo_selections: dict | None = None,
     ) -> int:
         """Helper method to run source subtask segment selection.
 
@@ -422,8 +423,11 @@ class DataGenerator:
             The selected source demo index
         """
         if subtask_object_name is None:
-            # no reference object - only random selection is supported
-            assert selection_strategy_name == "random", selection_strategy_name
+            # No reference object — only strategies that do not rely on a
+            # reference object pose are allowed here.  ``source_from_subtask``
+            # reuses a prior subtask's selection and never inspects the
+            # object pose, so it's safe.
+            assert selection_strategy_name in ("random", "source_from_subtask"), selection_strategy_name
 
         # We need to collect the datagen info objects over the timesteps for the subtask segment in each source
         # demo, so that it can be used by the selection strategy.
@@ -466,6 +470,9 @@ class DataGenerator:
             object_pose=object_pose,
             src_subtask_datagen_infos=src_subtask_datagen_infos,
             all_object_poses=all_object_poses,
+            eef_name=eef_name,
+            source_demo_selections=source_demo_selections,
+            subtask_configs=self.env_cfg.subtask_configs.get(eef_name),
             **selection_strategy_kwargs,
         )
 
@@ -479,6 +486,7 @@ class DataGenerator:
         all_randomized_subtask_boundaries: dict,
         runtime_subtask_constraints_dict: dict,
         selected_src_demo_inds: dict,
+        source_demo_selections: dict | None = None,
     ) -> WaypointTrajectory:
         """Build a transformed waypoint trajectory for a single subtask of an end-effector.
 
@@ -583,6 +591,7 @@ class DataGenerator:
                 selection_strategy_name=self.env_cfg.subtask_configs[eef_name][subtask_ind].selection_strategy,
                 selection_strategy_kwargs=self.env_cfg.subtask_configs[eef_name][subtask_ind].selection_strategy_kwargs,
                 all_object_poses=all_current_object_poses,
+                source_demo_selections=source_demo_selections,
             )
 
         assert selected_src_demo_inds[eef_name] is not None
@@ -919,6 +928,7 @@ class DataGenerator:
                                 randomized_subtask_boundaries,
                                 runtime_subtask_constraints_dict,
                                 current_eef_selected_src_demo_indices,  # updated in the method
+                                source_demo_selections=source_demo_selections,
                             )
                             # Track which source demo was chosen for this subtask.
                             source_demo_selections[eef_name].append(
@@ -1140,6 +1150,46 @@ class DataGenerator:
                 if current_eef_subtask_step_indices[eef_name] == len(
                     current_eef_subtask_trajectories[eef_name]
                 ):  # Subtask done
+                    # Hook: give the env a chance to verify the just-finished
+                    # subtask.  If verification fails, abort this trial and
+                    # let the runtime write a minimal "failed" episode.  We
+                    # only fire once per (arm, subtask) — subsequent passes
+                    # through this block for an arm whose last subtask has
+                    # already been marked done (the trajectory is padded by
+                    # repeating the final waypoint) must not re-verify.
+                    _verify = getattr(self.env, "verify_subtask_completion", None)
+                    if (
+                        callable(_verify)
+                        and subtask_ind >= 0
+                        and not eef_subtasks_done.get(eef_name, False)
+                    ):
+                        try:
+                            _fail_reason = _verify(
+                                arm_name=eef_name,
+                                subtask_index=int(subtask_ind),
+                                env_id=env_id,
+                            )
+                        except Exception as _exc:
+                            logger.debug(
+                                "verify_subtask_completion raised for %s[%s]: %s",
+                                eef_name,
+                                subtask_ind,
+                                _exc,
+                            )
+                            _fail_reason = None
+                        if _fail_reason:
+                            from lehome.tasks.fold_cloth.generation_errors import (
+                                SubtaskVerificationError,
+                            )
+
+                            raise SubtaskVerificationError(
+                                arm_name=eef_name,
+                                subtask_index=int(subtask_ind),
+                                fail_reason=str(_fail_reason),
+                                source_demo_selections={
+                                    k: list(v) for k, v in source_demo_selections.items()
+                                },
+                            )
                     for task_constraint in runtime_subtask_constraints_dict.get((eef_name, subtask_ind), []):
                         if task_constraint["type"] == SubTaskConstraintType._SEQUENTIAL_FORMER:
                             constrained_task_spec_key = task_constraint["constrained_task_spec_key"]
