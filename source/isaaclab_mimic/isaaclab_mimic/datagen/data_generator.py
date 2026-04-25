@@ -1243,6 +1243,41 @@ class DataGenerator:
             if all(eef_subtasks_done.values()):
                 break
 
+        # Settle steps after all subtasks complete.
+        #
+        # The success_term is invoked inside ``multi_waypoint.execute`` *before*
+        # the per-iteration "Subtask done" block runs ``_mark_subtask_completed``,
+        # so on the very iteration where the final subtask of the last arm
+        # finishes, the gate is still closed when success_term fires — and the
+        # loop then breaks before another evaluation. Without these extra steps
+        # ``recording_style_success_tensor``-style gated success terms can never
+        # observe a state where every arm has reached its fold-completion
+        # subtask, regardless of how cleanly the cloth was folded.
+        #
+        # Holding the last waypoint for a small number of additional env steps
+        # both gives the gate a chance to open and lets cloth physics settle so
+        # the geometry success check evaluates against a stable configuration.
+        if not generated_success:
+            settle_waypoint_dict = {
+                eef_name: current_eef_subtask_trajectories[eef_name][-1]
+                for eef_name in self.env_cfg.subtask_configs.keys()
+            }
+            for _ in range(20):
+                settle_multi_waypoint = MultiWaypoint(settle_waypoint_dict)
+                settle_results = await settle_multi_waypoint.execute(
+                    env=self.env,
+                    success_term=success_term,
+                    env_id=env_id,
+                    env_action_queue=env_action_queue,
+                )
+                if len(settle_results["states"]) > 0:
+                    generated_states.extend(settle_results["states"])
+                    generated_obs.extend(settle_results["observations"])
+                    generated_actions.extend(settle_results["actions"])
+                generated_success = generated_success or settle_results["success"]
+                if generated_success:
+                    break
+
         # Merge numpy arrays
         if len(generated_actions) > 0:
             generated_actions = torch.cat(generated_actions, dim=0)
